@@ -1,4 +1,3 @@
-// ExtendedInstrumentationPass.cpp
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
@@ -6,6 +5,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -13,37 +13,58 @@
 
 using namespace llvm;
 
-// Event type definitions.
-enum EventType
-{
-  READ_EVENT = 0,
-  WRITE_EVENT = 1,
-  ACQUIRE_EVENT = 2,
-  RELEASE_EVENT = 3,
-  FORK_EVENT = 4,
-  JOIN_EVENT = 5,
-  ATOMIC_BEGIN_EVENT = 6,
-  ATOMIC_END_EVENT = 7
-};
-
 namespace
 {
-
   struct ExtendedInstrumentationPass : public PassInfoMixin<ExtendedInstrumentationPass>
   {
-    // Main entry point for the pass.
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &)
     {
       LLVMContext &Context = M.getContext();
+      // DataLayout* dataLayout = new DataLayout(&M); // for tracking size of accesses
 
-      // Extend the external logging function signature to include a line number:
+      // log function types for each event
+      FunctionType *logReadType = FunctionType::get(
+          Type::getVoidTy(Context),
+          {PointerType::get(Type::getInt8Ty(Context), 0),
+           Type::getInt32Ty(Context), Type::getInt32Ty(Context)},
+          false);
+      FunctionCallee logReadFunc = M.getOrInsertFunction("logReadEvent", logReadType);
 
-      FunctionType *logFuncType =
-          FunctionType::get(Type::getVoidTy(Context),
-                            {Type::getInt32Ty(Context), PointerType::get(Type::getInt8Ty(Context), 0), Type::getInt32Ty(Context)}, false);
-      FunctionCallee logFunc = M.getOrInsertFunction("logEvent", logFuncType);
+      FunctionType *logWriteType = FunctionType::get(
+          Type::getVoidTy(Context),
+          {PointerType::get(Type::getInt8Ty(Context), 0),
+           Type::getInt32Ty(Context), Type::getInt32Ty(Context)},
+          false);
+      FunctionCallee logWriteFunc = M.getOrInsertFunction("logWriteEvent", logWriteType);
 
-      // Iterate over every function in the module.
+      FunctionType *logAcquireType = FunctionType::get(
+          Type::getVoidTy(Context),
+          {PointerType::get(Type::getInt8Ty(Context), 0), Type::getInt32Ty(Context)},
+          false);
+      FunctionCallee logAcquireFunc = M.getOrInsertFunction("logAcquireEvent", logAcquireType);
+
+      FunctionType *logReleaseType = FunctionType::get(
+          Type::getVoidTy(Context),
+          {PointerType::get(Type::getInt8Ty(Context), 0), Type::getInt32Ty(Context)},
+          false);
+      FunctionCallee logReleaseFunc = M.getOrInsertFunction("logReleaseEvent", logReleaseType);
+
+      FunctionType *logForkType = FunctionType::get(
+          Type::getVoidTy(Context), {Type::getInt32Ty(Context)}, false);
+      FunctionCallee logForkFunc = M.getOrInsertFunction("logForkEvent", logForkType);
+
+      FunctionType *logJoinType = FunctionType::get(
+          Type::getVoidTy(Context), {Type::getInt32Ty(Context)}, false);
+      FunctionCallee logJoinFunc = M.getOrInsertFunction("logJoinEvent", logJoinType);
+
+      FunctionType *logAtomicBeginType = FunctionType::get(
+          Type::getVoidTy(Context), {Type::getInt32Ty(Context)}, false);
+      FunctionCallee logAtomicBeginFunc = M.getOrInsertFunction("logAtomicBeginEvent", logAtomicBeginType);
+
+      FunctionType *logAtomicEndType = FunctionType::get(
+          Type::getVoidTy(Context), {Type::getInt32Ty(Context)}, false);
+      FunctionCallee logAtomicEndFunc = M.getOrInsertFunction("logAtomicEndEvent", logAtomicEndType);
+
       for (Function &F : M)
       {
         if (F.isDeclaration())
@@ -51,27 +72,21 @@ namespace
 
         for (BasicBlock &BB : F)
         {
-          // To avoid iterator invalidation, first collect instructions to instrument.
           SmallVector<Instruction *, 16> targets;
           for (Instruction &I : BB)
           {
-            // Instrument loads and stores.
             if (isa<LoadInst>(&I) || isa<StoreInst>(&I))
             {
               targets.push_back(&I);
             }
             else if (auto *CI = dyn_cast<CallBase>(&I))
             {
-              // Check for calls to synchronization and atomic marker functions.
               if (Function *called = CI->getCalledFunction())
               {
                 StringRef funcName = called->getName();
-                if (funcName == "pthread_mutex_lock" ||
-                    funcName == "pthread_mutex_unlock" ||
-                    funcName == "pthread_create" ||
-                    funcName == "pthread_join" ||
-                    funcName == "atomic_begin" ||
-                    funcName == "atomic_end")
+                if (funcName == "pthread_mutex_lock" || funcName == "pthread_mutex_unlock" ||
+                    funcName == "pthread_create" || funcName == "pthread_join" ||
+                    funcName == "atomic_begin" || funcName == "atomic_end")
                 {
                   targets.push_back(&I);
                 }
@@ -79,27 +94,33 @@ namespace
             }
           }
 
-          // Insert logging calls before each target instruction.
           for (Instruction *I : targets)
           {
             IRBuilder<> builder(I);
 
             // Get the source line number from debug metadata (if available).
+            // probably usefull in finding what caused dataRace.
             unsigned line = 0;
             if (DILocation *Loc = I->getDebugLoc())
               line = Loc->getLine();
+            Value *lineConstant = ConstantInt::get(Type::getInt32Ty(Context), line);
 
             if (auto *loadInst = dyn_cast<LoadInst>(I))
             {
               // For non-atomic loads, log a read event.
               if (!loadInst->isAtomic())
               {
+                // I'm not sure if this is correct, ie. if it returns the size of load/store access
+                Type *ty = loadInst->getType();
+                unsigned size = ty->getPrimitiveSizeInBits() / 8;
                 Value *ptr = loadInst->getPointerOperand();
+
+                // this was in stackoverflow, doesn't work rn 
+                // PointerType *ptrType = cast<PointerType>(ptr->getType());
+                // uint64_t size = dataLayout->getTypeStoreSize(ptrType->getPointerElementType());
+                
                 Value *castedPtr = builder.CreateBitCast(ptr, PointerType::get(Type::getInt8Ty(Context), 0));
-                Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), READ_EVENT);
-                builder.CreateCall(logFunc,
-                                   {eventType, castedPtr,
-                                    ConstantInt::get(Type::getInt32Ty(Context), line)});
+                builder.CreateCall(logReadFunc, {castedPtr, ConstantInt::get(Type::getInt32Ty(Context), size), lineConstant});
               }
             }
             else if (auto *storeInst = dyn_cast<StoreInst>(I))
@@ -107,12 +128,17 @@ namespace
               // For non-atomic stores, log a write event.
               if (!storeInst->isAtomic())
               {
+                // I'm not sure if this is correct, ie. if it returns the size of load/store access
+                Type *ty = storeInst->getValueOperand()->getType();
+                unsigned size = ty->getPrimitiveSizeInBits() / 8;
                 Value *ptr = storeInst->getPointerOperand();
+
+                // this was in stackoverflow, doesn't work rn 
+                // PointerType *ptrType = cast<PointerType>(ptr->getType());
+                // uint64_t size = dataLayout->getTypeStoreSize(ptrType->getPointerElementType());
+                
                 Value *castedPtr = builder.CreateBitCast(ptr, PointerType::get(Type::getInt8Ty(Context), 0));
-                Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), WRITE_EVENT);
-                builder.CreateCall(logFunc,
-                                   {eventType, castedPtr,
-                                    ConstantInt::get(Type::getInt32Ty(Context), line)});
+                builder.CreateCall(logWriteFunc, {castedPtr, ConstantInt::get(Type::getInt32Ty(Context), size), lineConstant});
               }
             }
             else if (auto *CI = dyn_cast<CallBase>(I))
@@ -120,67 +146,38 @@ namespace
               if (Function *called = CI->getCalledFunction())
               {
                 StringRef funcName = called->getName();
-                // For mutex lock, log an acquire event.
-                if (funcName == "pthread_mutex_lock")
+                // Currently, acquire event: 
+                // For mutex lock only
+                if (funcName == "pthread_mutex_lock" && CI->arg_size() >= 1)
                 {
-                  if (CI->arg_size() >= 1)
-                  {
-                    Value *mutexArg = CI->getArgOperand(0);
-                    Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
-                    Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), ACQUIRE_EVENT);
-                    builder.CreateCall(logFunc,
-                                       {eventType, castedPtr,
-                                        ConstantInt::get(Type::getInt32Ty(Context), line)});
-                  }
+                  Value *mutexArg = CI->getArgOperand(0);
+                  Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
+                  builder.CreateCall(logAcquireFunc, {castedPtr, lineConstant});
                 }
-                // For mutex unlock, log a release event.
-                else if (funcName == "pthread_mutex_unlock")
+
+                // Currently, release event: 
+                // For mutex unlock only
+                else if (funcName == "pthread_mutex_unlock" && CI->arg_size() >= 1)
                 {
-                  if (CI->arg_size() >= 1)
-                  {
-                    Value *mutexArg = CI->getArgOperand(0);
-                    Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
-                    Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), RELEASE_EVENT);
-                    builder.CreateCall(logFunc,
-                                       {eventType, castedPtr,
-                                        ConstantInt::get(Type::getInt32Ty(Context), line)});
-                  }
+                  Value *mutexArg = CI->getArgOperand(0);
+                  Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
+                  builder.CreateCall(logReleaseFunc, {castedPtr, lineConstant});
                 }
-                // For thread creation, log a fork event.
                 else if (funcName == "pthread_create")
                 {
-                  Value *nullPtr = Constant::getNullValue(PointerType::get(Type::getInt8Ty(Context), 0));
-                  Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), FORK_EVENT);
-                  builder.CreateCall(logFunc,
-                                     {eventType, nullPtr,
-                                      ConstantInt::get(Type::getInt32Ty(Context), line)});
+                  builder.CreateCall(logForkFunc, {lineConstant});
                 }
-                // For thread join, log a join event.
                 else if (funcName == "pthread_join")
                 {
-                  Value *nullPtr = Constant::getNullValue(PointerType::get(Type::getInt8Ty(Context), 0));
-                  Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), JOIN_EVENT);
-                  builder.CreateCall(logFunc,
-                                     {eventType, nullPtr,
-                                      ConstantInt::get(Type::getInt32Ty(Context), line)});
+                  builder.CreateCall(logJoinFunc, {lineConstant});
                 }
-                // For explicit atomic block begin marker.
                 else if (funcName == "atomic_begin")
                 {
-                  Value *nullPtr = Constant::getNullValue(PointerType::get(Type::getInt8Ty(Context), 0));
-                  Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), ATOMIC_BEGIN_EVENT);
-                  builder.CreateCall(logFunc,
-                                     {eventType, nullPtr,
-                                      ConstantInt::get(Type::getInt32Ty(Context), line)});
+                  builder.CreateCall(logAtomicBeginFunc, {lineConstant});
                 }
-                // For explicit atomic block end marker.
                 else if (funcName == "atomic_end")
                 {
-                  Value *nullPtr = Constant::getNullValue(PointerType::get(Type::getInt8Ty(Context), 0));
-                  Value *eventType = ConstantInt::get(Type::getInt32Ty(Context), ATOMIC_END_EVENT);
-                  builder.CreateCall(logFunc,
-                                     {eventType, nullPtr,
-                                      ConstantInt::get(Type::getInt32Ty(Context), line)});
+                  builder.CreateCall(logAtomicEndFunc, {lineConstant});
                 }
               }
             }
@@ -191,7 +188,7 @@ namespace
     }
   };
 
-} // end anonymous namespace
+} // namespace
 
 // Register the pass with the LLVM pass manager.
 llvm::PassPluginLibraryInfo getExtendedInstrumentationPassPluginInfo()
