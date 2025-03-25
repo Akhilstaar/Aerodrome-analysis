@@ -20,7 +20,7 @@ namespace
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &)
     {
       LLVMContext &Context = M.getContext();
-      DataLayout* dataLayout = new DataLayout(&M); // for tracking size of accesses
+      DataLayout *dataLayout = new DataLayout(&M); // for tracking size of accesses
 
       // log function types for each event
 
@@ -30,55 +30,53 @@ namespace
 
       FunctionType *logReadType = FunctionType::get(
           Type::getVoidTy(Context),
-          { Type::getInt64Ty(Context),
-            PointerType::get(Type::getInt8Ty(Context), 0),
-            Type::getInt32Ty(Context), Type::getInt32Ty(Context)},
+          {Type::getInt64Ty(Context),
+           PointerType::get(Type::getInt8Ty(Context), 0),
+           Type::getInt32Ty(Context), Type::getInt32Ty(Context)},
           false);
       FunctionCallee logReadFunc = M.getOrInsertFunction("logReadEvent", logReadType);
 
       FunctionType *logWriteType = FunctionType::get(
           Type::getVoidTy(Context),
-          { Type::getInt64Ty(Context),
-            PointerType::get(Type::getInt8Ty(Context), 0),
+          {Type::getInt64Ty(Context),
+           PointerType::get(Type::getInt8Ty(Context), 0),
            Type::getInt32Ty(Context), Type::getInt32Ty(Context)},
           false);
       FunctionCallee logWriteFunc = M.getOrInsertFunction("logWriteEvent", logWriteType);
 
       FunctionType *logAcquireType = FunctionType::get(
           Type::getVoidTy(Context),
-          { Type::getInt64Ty(Context),
-            PointerType::get(Type::getInt8Ty(Context), 0), 
-            Type::getInt32Ty(Context)},
+          {Type::getInt64Ty(Context),
+           PointerType::get(Type::getInt8Ty(Context), 0),
+           Type::getInt32Ty(Context)},
           false);
       FunctionCallee logAcquireFunc = M.getOrInsertFunction("logAcquireEvent", logAcquireType);
 
       FunctionType *logReleaseType = FunctionType::get(
           Type::getVoidTy(Context),
-          { Type::getInt64Ty(Context),
-            PointerType::get(Type::getInt8Ty(Context), 0), 
-            Type::getInt32Ty(Context)},
+          {Type::getInt64Ty(Context),
+           PointerType::get(Type::getInt8Ty(Context), 0),
+           Type::getInt32Ty(Context)},
           false);
       FunctionCallee logReleaseFunc = M.getOrInsertFunction("logReleaseEvent", logReleaseType);
 
       FunctionType *logForkType = FunctionType::get(
-          Type::getVoidTy(Context), 
-          { Type::getInt64Ty(Context), 
-            Type::getInt64Ty(Context), 
-            Type::getInt32Ty(Context)}, 
+          Type::getVoidTy(Context),
+          {Type::getInt64Ty(Context),
+           Type::getInt64Ty(Context),
+           Type::getInt32Ty(Context)},
           false);
       FunctionCallee logForkFunc = M.getOrInsertFunction("logForkEvent", logForkType);
 
       FunctionType *logJoinType = FunctionType::get(
-          Type::getVoidTy(Context), 
-          { Type::getInt64Ty(Context), 
-            Type::getInt64Ty(Context), 
-            Type::getInt32Ty(Context)},
+          Type::getVoidTy(Context),
+          {Type::getInt64Ty(Context),
+           Type::getInt32Ty(Context)},
           false);
       FunctionCallee logJoinFunc = M.getOrInsertFunction("logJoinEvent", logJoinType);
 
       FunctionType *logAtomicBeginType = FunctionType::get(
-          Type::getVoidTy(Context), {
-            Type::getInt64Ty(Context), Type::getInt32Ty(Context)}, false);
+          Type::getVoidTy(Context), {Type::getInt64Ty(Context), Type::getInt32Ty(Context)}, false);
       FunctionCallee logAtomicBeginFunc = M.getOrInsertFunction("logAtomicBeginEvent", logAtomicBeginType);
 
       FunctionType *logAtomicEndType = FunctionType::get(
@@ -89,6 +87,37 @@ namespace
       {
         if (F.isDeclaration())
           continue;
+
+        // TODO: Log thread end event for parent process as well.
+
+        // Log Parent process creation as thread begin event.
+        if (F.getName() == "main")
+        {
+          // Instrument at function entry for main thread start.
+          IRBuilder<> builder(&*F.getEntryBlock().getFirstInsertionPt());
+          Value *tid = builder.CreateCall(pthreadSelfFunc);
+          tid = builder.CreateIntCast(tid, Type::getInt64Ty(Context), false);
+          Value *parentTID = ConstantInt::get(Type::getInt64Ty(Context), 0LL); // I'm not sure what to initialize this thing with, so setting it to 0 for now.
+
+          unsigned line = 0;
+
+          // Unnecessary effort to get line number, but enjoyed it ;)
+          for (BasicBlock &BB : F)
+          {
+            for (Instruction &I : BB)
+            {
+              if (DILocation *Loc = I.getDebugLoc())
+              {
+                line = Loc->getLine();
+                break;
+              }
+            }
+            break;
+          }
+
+          Value *lineConstant = ConstantInt::get(Type::getInt32Ty(Context), line);
+          builder.CreateCall(logForkFunc, {parentTID, tid, lineConstant});
+        }
 
         for (BasicBlock &BB : F)
         {
@@ -122,7 +151,7 @@ namespace
             // Get the current TID
             Value *tid = builder.CreateCall(pthreadSelfFunc);
             tid = builder.CreateIntCast(tid, Type::getInt64Ty(Context), false);
-            
+
             // Get the source line number from debug metadata (if available).
             // probably usefull in finding what caused dataRace.
             unsigned line = 0;
@@ -196,10 +225,9 @@ namespace
                 }
                 else if (funcName == "pthread_join" && CI->arg_size() >= 1)
                 {
-                  Value *parentTID = tid; // Current thread is the parent ( ? )
                   Value *childTID = CI->getArgOperand(0);
                   childTID = builder.CreateIntCast(childTID, Type::getInt64Ty(Context), false);
-                  builder.CreateCall(logJoinFunc, {parentTID, childTID, lineConstant});
+                  builder.CreateCall(logJoinFunc, {childTID, lineConstant});
                 }
                 else if (funcName == "atomic_begin")
                 {

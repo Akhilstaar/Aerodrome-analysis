@@ -31,9 +31,9 @@ extern "C" void logForkEvent(long long parentTID, long long childTID, int line) 
     logFile << "Thread begin: Parent TID: " << parentTID << ", Child TID: " << childTID << " at line " << line << "\n";
 }
 
-extern "C" void logJoinEvent(long long parentTID, long long childTID, int line) {
+extern "C" void logJoinEvent(long long TID, int line) {
     std::lock_guard<std::mutex> guard(logMutex);
-    logFile << "Thread ended: Parent TID: " << parentTID << ", Child TID: " << childTID << " at line " << line << "\n";
+    logFile << "Thread ended: TID: " << TID << " at line " << line << "\n";
 }
 
 extern "C" void logAtomicBeginEvent(long long tid, int line) {
