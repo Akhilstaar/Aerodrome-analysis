@@ -20,7 +20,7 @@ namespace
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &)
     {
       LLVMContext &Context = M.getContext();
-      DataLayout *dataLayout = new DataLayout(&M); // for tracking size of accesses
+      const DataLayout &dataLayout = M.getDataLayout(); // for tracking size of accesses
 
       // log function types for each event
 
@@ -85,7 +85,7 @@ namespace
 
       for (Function &F : M)
       {
-        if (F.isDeclaration())
+        if (F.isDeclaration()) // skips external functions
           continue;
 
         // TODO: Log thread end event for parent process as well.
@@ -100,35 +100,24 @@ namespace
           Value *parentTID = ConstantInt::get(Type::getInt64Ty(Context), 0LL); // I'm not sure what to initialize this thing with, so setting it to 0 for now.
 
           unsigned line = 0;
-
-          // Unnecessary effort to get line number, but enjoyed it ;)
-          for (BasicBlock &BB : F)
-          {
-            for (Instruction &I : BB)
-            {
-              if (DILocation *Loc = I.getDebugLoc())
-              {
-                line = Loc->getLine();
-                break;
-              }
-            }
-            break;
-          }
+          if (DISubprogram *SP = F.getSubprogram())
+            line = SP->getLine();
 
           Value *lineConstant = ConstantInt::get(Type::getInt32Ty(Context), line);
           builder.CreateCall(logForkFunc, {parentTID, tid, lineConstant});
         }
 
+        SmallVector<Instruction *, 16> targets;
+
         for (BasicBlock &BB : F)
         {
-          SmallVector<Instruction *, 16> targets;
           for (Instruction &I : BB)
           {
             if (isa<LoadInst>(&I) || isa<StoreInst>(&I))
             {
               targets.push_back(&I);
             }
-            else if (auto *CI = dyn_cast<CallBase>(&I))
+            else if (auto *CI = dyn_cast<CallBase>(&I)) // function call like instructions
             {
               if (Function *called = CI->getCalledFunction())
               {
@@ -142,101 +131,109 @@ namespace
               }
             }
           }
+        }
 
-          for (Instruction *I : targets)
+        for (Instruction *I : targets)
+        {
+          IRBuilder<> builder(I);
+
+          // TODO: Optimize this thing further. (if possible)
+          // Get the current TID
+          Value *tid = builder.CreateCall(pthreadSelfFunc);
+          tid = builder.CreateIntCast(tid, Type::getInt64Ty(Context), false);
+
+          // Get the source line number from debug metadata (if available).
+          // probably usefull in finding what caused dataRace.
+          unsigned line = 0;
+          if (DILocation *Loc = I->getDebugLoc())
+            line = Loc->getLine();
+          Value *lineConstant = ConstantInt::get(Type::getInt32Ty(Context), line);
+
+          if (auto *loadInst = dyn_cast<LoadInst>(I))
           {
-            IRBuilder<> builder(I);
+            // TODO: consider atomic RMW's as well.
 
-            // TODO: Optimize this thing further. (if possible)
-            // Get the current TID
-            Value *tid = builder.CreateCall(pthreadSelfFunc);
-            tid = builder.CreateIntCast(tid, Type::getInt64Ty(Context), false);
-
-            // Get the source line number from debug metadata (if available).
-            // probably usefull in finding what caused dataRace.
-            unsigned line = 0;
-            if (DILocation *Loc = I->getDebugLoc())
-              line = Loc->getLine();
-            Value *lineConstant = ConstantInt::get(Type::getInt32Ty(Context), line);
-
-            if (auto *loadInst = dyn_cast<LoadInst>(I))
+            // For non-atomic loads, log a read event
+            if (!loadInst->isAtomic())
             {
-              // TODO: consider atomic RMW's as well.
+              // I'm not sure if this is implemented correctly, ie. if it returns the size of load/store access
+              Type *ty = loadInst->getType();
+              Value *ptr = loadInst->getPointerOperand();
+              uint64_t size = dataLayout.getTypeSizeInBits(ty) / 8;
 
-              // For non-atomic loads, log a read event
-              if (!loadInst->isAtomic())
-              {
-                // I'm not sure if this is implemented correctly, ie. if it returns the size of load/store access
-                Type *ty = loadInst->getType();
-                Value *ptr = loadInst->getPointerOperand();
-                uint64_t size = dataLayout->getTypeSizeInBits(ty) / 8;
-
-                Value *castedPtr = builder.CreateBitCast(ptr, PointerType::get(Type::getInt8Ty(Context), 0));
-                builder.CreateCall(logReadFunc, {tid, castedPtr, ConstantInt::get(Type::getInt32Ty(Context), size), lineConstant});
-              }
+              Value *castedPtr = builder.CreateBitCast(ptr, PointerType::get(Type::getInt8Ty(Context), 0));
+              builder.CreateCall(logReadFunc, {tid, castedPtr, ConstantInt::get(Type::getInt32Ty(Context), size), lineConstant});
             }
-            else if (auto *storeInst = dyn_cast<StoreInst>(I))
+          }
+          else if (auto *storeInst = dyn_cast<StoreInst>(I))
+          {
+            // For non-atomic stores, log a write event.
+            if (!storeInst->isAtomic())
             {
-              // For non-atomic stores, log a write event.
-              if (!storeInst->isAtomic())
-              {
-                // I'm not sure if this is implemented correctly, ie. if it returns the size of load/store access
-                Value *ptr = storeInst->getPointerOperand();
-                Value *storeValue = storeInst->getValueOperand();
-                Type *storeType = storeValue->getType();
-                uint64_t size = dataLayout->getTypeSizeInBits(storeType) / 8;
+              // I'm not sure if this is implemented correctly, ie. if it returns the size of load/store access
+              Value *ptr = storeInst->getPointerOperand();
+              Value *storeValue = storeInst->getValueOperand();
+              Type *storeType = storeValue->getType();
+              uint64_t size = dataLayout.getTypeSizeInBits(storeType) / 8;
 
-                Value *castedPtr = builder.CreateBitCast(ptr, PointerType::get(Type::getInt8Ty(Context), 0));
-                builder.CreateCall(logWriteFunc, {tid, castedPtr, ConstantInt::get(Type::getInt32Ty(Context), size), lineConstant});
-              }
+              Value *castedPtr = builder.CreateBitCast(ptr, PointerType::get(Type::getInt8Ty(Context), 0));
+              builder.CreateCall(logWriteFunc, {tid, castedPtr, ConstantInt::get(Type::getInt32Ty(Context), size), lineConstant});
             }
-            else if (auto *CI = dyn_cast<CallBase>(I))
+          }
+          else if (auto *CI = dyn_cast<CallBase>(I))
+          {
+            if (Function *called = CI->getCalledFunction())
             {
-              if (Function *called = CI->getCalledFunction())
+              StringRef funcName = called->getName();
+
+              // Currently, acquire event:
+              // For mutex lock only
+              if (funcName == "pthread_mutex_lock" && CI->arg_size() >= 1)
               {
-                StringRef funcName = called->getName();
+                Value *mutexArg = CI->getArgOperand(0);
+                Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
+                builder.CreateCall(logAcquireFunc, {tid, castedPtr, lineConstant});
+              }
 
-                // Currently, acquire event:
-                // For mutex lock only
-                if (funcName == "pthread_mutex_lock" && CI->arg_size() >= 1)
-                {
-                  Value *mutexArg = CI->getArgOperand(0);
-                  Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
-                  builder.CreateCall(logAcquireFunc, {tid, castedPtr, lineConstant});
-                }
+              // Currently, release event:
+              // For mutex unlock only
+              else if (funcName == "pthread_mutex_unlock" && CI->arg_size() >= 1)
+              {
+                Value *mutexArg = CI->getArgOperand(0);
+                Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
+                builder.CreateCall(logReleaseFunc, {tid, castedPtr, lineConstant});
+              }
+              else if (funcName == "pthread_create")
+              {
+                Value *parentTID = tid; // Current thread is the parent ( ? )
+                Value *threadArg = CI->getArgOperand(0);
 
-                // Currently, release event:
-                // For mutex unlock only
-                else if (funcName == "pthread_mutex_unlock" && CI->arg_size() >= 1)
+                // Load child TID after pthread_create
+                builder.SetInsertPoint(I->getNextNode());
+                Value *childTID = builder.CreateLoad(Type::getInt64Ty(Context), threadArg);
+                builder.CreateCall(logForkFunc, {parentTID, childTID, lineConstant});
+              }
+              else if (funcName == "pthread_join" && CI->arg_size() >= 1)
+              {
+                // Value *childTID = CI->getArgOperand(0);
+                // childTID = builder.CreateIntCast(childTID, Type::getInt64Ty(Context), false);
+                // builder.CreateCall(logJoinFunc, {childTID, lineConstant});
+                Instruction *Next = CI->getNextNode();
+                if (Next)
                 {
-                  Value *mutexArg = CI->getArgOperand(0);
-                  Value *castedPtr = builder.CreateBitCast(mutexArg, PointerType::get(Type::getInt8Ty(Context), 0));
-                  builder.CreateCall(logReleaseFunc, {tid, castedPtr, lineConstant});
-                }
-                else if (funcName == "pthread_create")
-                {
-                  Value *parentTID = tid; // Current thread is the parent ( ? )
-                  Value *threadArg = CI->getArgOperand(0);
-
-                  // Load child TID after pthread_create
-                  builder.SetInsertPoint(I->getNextNode());
-                  Value *childTID = builder.CreateLoad(Type::getInt64Ty(Context), threadArg);
-                  builder.CreateCall(logForkFunc, {parentTID, childTID, lineConstant});
-                }
-                else if (funcName == "pthread_join" && CI->arg_size() >= 1)
-                {
+                  builder.SetInsertPoint(Next);
                   Value *childTID = CI->getArgOperand(0);
                   childTID = builder.CreateIntCast(childTID, Type::getInt64Ty(Context), false);
                   builder.CreateCall(logJoinFunc, {childTID, lineConstant});
                 }
-                else if (funcName == "atomic_begin")
-                {
-                  builder.CreateCall(logAtomicBeginFunc, {lineConstant});
-                }
-                else if (funcName == "atomic_end")
-                {
-                  builder.CreateCall(logAtomicEndFunc, {lineConstant});
-                }
+              }
+              else if (funcName == "atomic_begin")
+              {
+                builder.CreateCall(logAtomicBeginFunc, {lineConstant});
+              }
+              else if (funcName == "atomic_end")
+              {
+                builder.CreateCall(logAtomicEndFunc, {lineConstant});
               }
             }
           }
