@@ -1,43 +1,47 @@
+#include "parse.h"
 #include "Aerodrome.h"
 #include <iostream>
-#include <fstream>
-#include <chrono>
 
-using namespace std;
-using namespace chrono;
-
-int main(int argc, char* argv[]){
-    cin.tie(0); ios::sync_with_stdio(0);
-
+int main(int argc, char* argv[]) {
     if (argc != 2) {
-        cerr << "Usage: " << argv[0] << " <trace>" << endl;
-        cerr << "trace: Absolute path to the input trace file" << endl;
+        cerr << "Usage: " << argv[0] << " <trace_file>\n";
         return 1;
     }
+    Trace trace = parse_trace(argv[1]);
+    // trace.num_threads--; // removing tid=0 parent of main process.
 
-    string tracefile = argv[2];
+    // num theads print
+    // cout << "Number of threads: " << trace.num_threads << endl;
+    AerodromeState state;
+    aerodrome_init(&state, trace.num_threads);
+    int loglineno=1;
+    for (const Event& event : trace.events) {
+        int mapped_tid = get_mapped_tid(trace, event.tid);
+        if (mapped_tid == -1) {
+            cerr << "Error: Unmapped TID " << event.tid << endl;
+            continue;
+        }
 
-    // processing the file
-    vector<string> tracedata;
-    ifstream file(tracefile);
+        Event pevent;
+        pevent.tid = mapped_tid;
+        pevent.addr = event.addr;
+        pevent.type = event.type;
+        
+        if (event.type == EventType::THREAD_BEGIN) {
+            int parent_mapped = get_mapped_tid(trace, event.parent_tid);
+            if (parent_mapped == -1) {
+                cerr << "Error: Unmapped parent TID " << event.parent_tid << endl;
+                continue;
+            }
+            pevent.parent_tid = parent_mapped;
+        }
 
-    if(!file.is_open()){
-        cerr << "Error: Unable to open file " << tracefile << endl;
-        return 1;
+
+        aerodrome_process_event(&state, &pevent, loglineno);
+        loglineno++;
     }
 
-    string line;
-    while (getline(file, line)) {
-        tracedata.push_back(line);
-    }
-    tracedata.pop_back();  // last empty line
-
-    file.close();
-
-    // Passing the file contents to the algo's
-    // probably, I should've checked validity earlier to avoid overhead
-
-    Aerodrome(tracedata);
-
+    // aerodrome_cleanup(&state);
+    cout << "Analysis completed successfully\n";
     return 0;
 }
